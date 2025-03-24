@@ -6,6 +6,12 @@ use super::{
     view::TensorView,
 };
 
+use ort::tensor::IntoTensorElementType;
+use ort::value::{ValueType, TensorRefMut};
+use ort::memory::{MemoryInfo, MemoryType, AllocatorType, AllocationDevice};
+use ort::execution_providers::CUDAExecutionProvider;
+use cudarc::driver::CudaDevice;
+
 /// An error type for tensor operations.
 #[derive(Error, Debug, PartialEq)]
 pub enum TensorError {
@@ -718,6 +724,43 @@ where
             shape: self.shape,
             strides: self.strides,
         })
+    }
+
+    pub unsafe fn to_onnx(
+        &self,
+        device_name: &str,
+    ) -> Result<TensorRefMut<'_, T>, TensorError>
+    {
+        // check that device is either cpu, cuda, or cuda:num
+        if device_name != "cpu" && !device_name.starts_with("cuda") {
+            return Err(TensorError::UnsupportedOperation(format!(
+                "Unsupported device_name: {:?}",
+                device_name
+            )));
+        }
+
+        // split the device string to get the device type and id
+        let number: usize = 0;
+        if device_name.starts_with("cuda") {
+            if let (prefix, number_str) = device_name.split_once(':').unwrap_or((device_name, "0")) {
+                number = number_str.parse().expect("Failed to parse number");
+            }
+        }
+        println!("device_name: {:?}", device_name);
+
+        let device = CudaDevice::new(number)?;
+        let device_data = CUDAExecutionProvider::new(device)?;   
+        let ort_tensor: TensorRefMut<'_, T> = unsafe {
+            TensorRefMut::from_raw(
+                MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?,
+                (*device_data.device_ptr() as usize as *mut ()).cast(),
+                vec![1, 3, 640, 640]
+            )
+            .unwrap()
+        };
+
+        Ok(ort_tensor)
+
     }
 }
 
