@@ -6,11 +6,11 @@ use super::{
     view::TensorView,
 };
 
-use ort::tensor::IntoTensorElementType;
-use ort::value::{ValueType, TensorRefMut};
+use ort::tensor::{IntoTensorElementType, PrimitiveTensorElementType};
+use ort::value::{ValueType, TensorRefMut, Value, TensorValueType};
 use ort::memory::{MemoryInfo, MemoryType, AllocatorType, AllocationDevice};
 use ort::execution_providers::CUDAExecutionProvider;
-use cudarc::driver::CudaDevice;
+use cudarc::driver::{CudaDevice, DevicePtr};
 
 /// An error type for tensor operations.
 #[derive(Error, Debug, PartialEq)]
@@ -91,6 +91,7 @@ pub struct Tensor<T, const N: usize, A: TensorAllocator> {
 impl<T, const N: usize, A: TensorAllocator> Tensor<T, N, A>
 where
     A: 'static,
+    // T: std::fmt::Debug,
 {
     /// Get the data of the tensor as a slice.
     ///
@@ -726,41 +727,84 @@ where
         })
     }
 
+    /// Converts the Kornia tensor into an ONNX tensor.
     pub unsafe fn to_onnx(
-        &self,
+        self,
         device_name: &str,
-    ) -> Result<TensorRefMut<'_, T>, TensorError>
+    ) -> Result<Value<TensorValueType<T>>, TensorError>
+// ) -> Result<TensorRefMut<'_, T>, TensorError>
+    where
+        T: 'static +
+            IntoTensorElementType + 
+            PrimitiveTensorElementType + 
+            std::fmt::Debug + 
+            cudarc::driver::DeviceRepr + 
+            Clone,
     {
-        // check that device is either cpu, cuda, or cuda:num
-        if device_name != "cpu" && !device_name.starts_with("cuda") {
-            return Err(TensorError::UnsupportedOperation(format!(
+        // check that device is either cpu, cuda, or cuda:num. Default device number is 0.
+        // split the device string to get the device type and id
+        let mut device_number: usize = 0;
+        match device_name {
+            "cpu" => (),
+            "cuda" => (),
+            _ if device_name.starts_with("cuda:") => {
+                if let Ok(parsed_num) = device_name[5..].parse::<usize>() {
+                    device_number = parsed_num;
+                } else {
+                    return Err(TensorError::UnsupportedOperation(format!(
+                        "Invalid device_name: {:?}. Expected 'cuda:num' where num is an integer.",
+                        device_name
+                    )));
+                }
+            },
+            _ => return Err(TensorError::UnsupportedOperation(format!(
                 "Unsupported device_name: {:?}",
                 device_name
-            )));
-        }
-
-        // split the device string to get the device type and id
-        let number: usize = 0;
-        if device_name.starts_with("cuda") {
-            if let (prefix, number_str) = device_name.split_once(':').unwrap_or((device_name, "0")) {
-                number = number_str.parse().expect("Failed to parse number");
-            }
+            ))),
         }
         println!("device_name: {:?}", device_name);
 
-        let device = CudaDevice::new(number)?;
-        let device_data = CUDAExecutionProvider::new(device)?;   
+        if device_name == "cpu" {
+            let ort_tensor = ort::value::Tensor::from_array((self.shape, self.into_vec()))
+                .map_err(|err| TensorError::UnsupportedOperation(format!(
+                "Failed to create CPU Tensor, error: {:?}", 
+                err,
+            ))).unwrap();
+            return Ok(ort_tensor)
+        }
+
+
+        let shape = self.shape.iter().map(|&x| x as i64).collect();
+        let device = CudaDevice::new(device_number)
+            .map_err(|err| TensorError::UnsupportedOperation(format!(
+                "Failed to create CUDA device: {:?}, error: {:?}", 
+                device_number, err,
+            ))).unwrap();
+        let device_data = device.htod_sync_copy(&self.into_vec())
+            .map_err(|err| TensorError::UnsupportedOperation(format!(
+                "Failed to copy data to device: {:?}, error: {:?}", 
+                device, err,
+            ))).unwrap();
+        let mem_info = MemoryInfo::new(AllocationDevice::CUDA, device_number as i32, AllocatorType::Device, MemoryType::Default)
+            .map_err(|err| TensorError::UnsupportedOperation(format!(
+                "Failed to create memory info: {:?}, error: {:?}", 
+                device, err,
+            ))).unwrap();
+
         let ort_tensor: TensorRefMut<'_, T> = unsafe {
             TensorRefMut::from_raw(
-                MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?,
+                mem_info,
                 (*device_data.device_ptr() as usize as *mut ()).cast(),
-                vec![1, 3, 640, 640]
+                shape,
             )
             .unwrap()
         };
-
-        Ok(ort_tensor)
-
+        match ort_tensor.try_upgrade() {
+            Ok(ort_tensor) => Ok(ort_tensor),
+            Err(_) => Err(TensorError::UnsupportedOperation(
+                "Failed to upgrade TensorRefMut.".to_owned(),
+            )),
+        }
     }
 }
 

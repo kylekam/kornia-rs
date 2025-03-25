@@ -1,5 +1,5 @@
 [package]
-name = "onnx_to_kornia_gpu"
+name = "onnx_to_kornia_cuda"
 authors.workspace = true
 categories.workspace = true
 description.workspace = true

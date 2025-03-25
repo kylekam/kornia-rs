@@ -67,33 +67,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_intra_threads(4)?
         .commit_from_file(&args.onnx_model_path)?;
 
-    // get the model input dimensions, assumes (B, C, H, W) format
-    let mut width = 0;
-    let mut height = 0;
-    if let ValueType::Tensor{dimensions,..} = &model.inputs[0].input_type {
-        println!("model input dimensions: {:?}", dimensions);
-        width = dimensions[2];
-        height = dimensions[3];
-    }
 
     // cast and scale the image to f32
     let mut image_hwc_f32 = Image::from_size_val(image.size(), 0.0f32)?;
     kornia::image::ops::cast_and_scale(&image, &mut image_hwc_f32, 1.0 / 255.0)?;
 
-    // resize the image to model input dimensions
-    let new_size = ImageSize {
-        width: width as usize,
-        height: height as usize,
-    };
-
-    let mut image_resized = Image::<f32, 3>::from_size_val(new_size, 0.0)?;
-    imgproc::resize::resize_native(
-        &image_hwc_f32, &mut image_resized,
-        imgproc::interpolation::InterpolationMode::Bilinear,
-    )?;
-
     // convert to HWC -> CHW
-    let image_chw = image_resized.permute_axes([2, 0, 1]).as_contiguous();
+    let image_chw = image_hwc_f32.permute_axes([2, 0, 1]).as_contiguous();
 
     // TODO: create a Tensor::insert_axis in kornia-rs
     let image_nchw = Tensor::from_shape_vec(
@@ -107,19 +87,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CpuAllocator,
     )?;
 
+    // Working, CPU Kornia to CUDA ORT
     let device = "cuda:0";
-    let ort_tensor: TensorRefMut<'_, f32> = image_nchw.to_onnx(device);
+    let ort_tensor = unsafe{ image_nchw.to_onnx(device)?};
 
-    let device = CudaDevice::new(0)?;
-	let device_data = device.htod_sync_copy(&image_nchw.into_vec())?;
-    let ort_tensor: TensorRefMut<'_, f32> = unsafe {
-		TensorRefMut::from_raw(
-			MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?,
-			(*device_data.device_ptr() as usize as *mut ()).cast(),
-			vec![1, 3, 640, 640]
-		)
-		.unwrap()
-	};
+
+
+    // let device = CudaDevice::new(0)?;
+	// let device_data = device.htod_sync_copy(&image_nchw.into_vec())?;
+    // let ort_tensor: TensorRefMut<'_, f32> = unsafe {
+	// 	TensorRefMut::from_raw(
+	// 		MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?,
+	// 		(*device_data.device_ptr() as usize as *mut ()).cast(),
+	// 		vec![1, 3, 640, 640]
+	// 	)
+	// 	.unwrap()
+	// };
 
     // // make the ort tensor
     // let ort_tensor = ort::value::Tensor::from_array((image_nchw.shape, image_nchw.into_vec()))?;
@@ -146,17 +129,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let time = Instant::now();
 
-    // // run the model
-    // let outputs = model.run(ort::inputs![
-    //     "images" => ort_tensor,
-    // ]?)?;
-
-    let outputs = model.run([ort_tensor.into()])?;
+    // TODO: segfault if ort::env isn't initialized
+    // let outputs = model.run([ort_tensor.into()])?;
+    // run the model
+    let outputs = model.run(ort::inputs![
+        "input" => ort_tensor,
+    ]?)?;
 
     println!("time ms: {:?}", time.elapsed().as_secs_f32() * 1000.0);
 
     // get the outputs
-    let (out_shape, out_ort) = outputs["output0"].try_extract_raw_tensor::<f32>()?;
+    let (out_shape, out_ort) = outputs["output"].try_extract_raw_tensor::<f32>()?;
     println!("out_shape: {:?}", out_shape);
 
     let out_tensor = Tensor::<f32, 3, CpuAllocator>::from_shape_vec(
@@ -186,6 +169,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             h: chunk[5],
         })
         .collect::<Vec<_>>();
+
+    // get max scoring detection from detections
+    let max_detection = detections.iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap()).unwrap();
+    println!("max_detection: {:?}", max_detection);
 
     // filter out detections with low confidence
     let detections = detections
