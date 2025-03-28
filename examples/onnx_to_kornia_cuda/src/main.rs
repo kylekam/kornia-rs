@@ -87,10 +87,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CpuAllocator,
     )?;
 
-    // Working, CPU Kornia to CUDA ORT
-    let device = "cuda:0";
-    let ort_tensor = unsafe{ image_nchw.to_onnx(device)?};
-
+    // Working, from CPU Kornia to CUDA ORT
+    let device = "cpu";
+    let mut ort_tensor = unsafe{ image_nchw.to_onnx(device)?};
+    // from CPU ORT to CUDA ORT
+    let kornia_tensor = unsafe{
+        Tensor::<f32, 4, CpuAllocator>::from_onnx(
+            &mut ort_tensor,
+            "cpu", 
+            CpuAllocator
+        ).unwrap()
+    };
+    println!("kornia_tensor: {:?}", kornia_tensor.shape);
+    // Need to convert back for the model.run
+    ort_tensor = unsafe{ kornia_tensor.to_onnx(device)?};
 
 
     // let device = CudaDevice::new(0)?;

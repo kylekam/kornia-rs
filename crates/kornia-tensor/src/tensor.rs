@@ -38,6 +38,10 @@ pub enum TensorError {
     /// Unsupported operation for the given data type or tensor configuration.
     #[error("Unsupported operation: {0}")]
     UnsupportedOperation(String),
+
+    /// Unsupported device name for allocating tensor.
+    #[error("Incorrect device name: {0}")]
+    IncorrectDeviceName(String),
 }
 
 /// Compute the strides from the shape of a tensor.
@@ -57,6 +61,52 @@ pub(crate) fn get_strides_from_shape<const N: usize>(shape: [usize; N]) -> [usiz
         stride *= shape[i];
     }
     strides
+}
+
+/// Check the device name and return the device type and id.
+pub(crate) fn check_device_name(
+    device_name: &str,
+) -> Result<(String, Option<usize>), TensorError>
+{
+    // check that device is either cpu, cuda, or cuda:num. Default device number is 0.
+    // split the device string to get the device type and id
+    let mut device_number: usize = 0;
+    match device_name {
+        "cpu" => Ok((device_name.to_string(), None)),
+        "cuda" => Ok((device_name.to_string(), Some(device_number))),
+        _ if device_name.starts_with("cuda:") => {
+            if let Ok(parsed_num) = device_name[5..].parse::<usize>() {
+                device_number = parsed_num;
+                Ok((device_name.to_string(), Some(device_number)))
+            } else {
+                return Err(TensorError::UnsupportedOperation(format!(
+                    "Invalid device_name: {:?}. Expected 'cuda:num' where num is an integer.",
+                    device_name
+                )));
+            }
+        },
+        _ => return Err(TensorError::UnsupportedOperation(format!(
+            "Unsupported device_name: {:?}",
+            device_name
+        ))),
+    }
+}
+
+/// Util for converting vec to array.
+pub(crate) fn unsqueeze_vec<const N: usize>(slice: &[usize]) -> Result<[usize; N], TensorError> {
+    let mut array: [usize; N] = [0; N];
+    match slice.len() {
+        2 | 3 | 4 | 5 => {
+            for index in 0..N {
+                array[index] = slice[index];
+            }
+            return Ok(array);
+        }
+        _ => {
+            println!("Unsupported Vec size: {:?}", slice);
+            return Err(TensorError::InvalidShape(slice.len()));
+        }
+    }
 }
 
 /// A data structure to represent a multi-dimensional tensor.
@@ -732,7 +782,6 @@ where
         self,
         device_name: &str,
     ) -> Result<Value<TensorValueType<T>>, TensorError>
-// ) -> Result<TensorRefMut<'_, T>, TensorError>
     where
         T: 'static +
             IntoTensorElementType + 
@@ -757,10 +806,7 @@ where
                     )));
                 }
             },
-            _ => return Err(TensorError::UnsupportedOperation(format!(
-                "Unsupported device_name: {:?}",
-                device_name
-            ))),
+            _ => return Err(TensorError::UnsupportedOperation(device_name.to_owned())),
         }
         println!("device_name: {:?}", device_name);
 
@@ -806,6 +852,107 @@ where
             )),
         }
     }
+        
+    /// Util for converting vec to array.
+    pub fn unsqueeze_vec_2(vec: Vec<i64>) -> Result<[i64; 2], TensorError> {
+        match vec.as_slice() {
+            [a, b] => {
+                let array: [i64; 2] = [*a, *b];
+                return Ok(array);
+            }
+            _ => {
+                println!("Unsupported Vec size: {:?}", vec);
+                return Err(TensorError::InvalidShape(vec.as_slice().len()));
+            }
+        }
+    }
+    
+    /// Util for converting vec to array.
+    pub fn unsqueeze_vec_3(vec: Vec<i64>) -> Result<[i64; 3], TensorError> {
+        match vec.as_slice() {
+            [a, b, c] => {
+                let array: [i64; 3] = [*a, *b, *c];
+                return Ok(array);
+            }
+            _ => {
+                println!("Unsupported Vec size: {:?}", vec);
+                return Err(TensorError::InvalidShape(vec.as_slice().len()));
+            }
+        }
+    }
+
+    /// Converts ONNX tensor to Kornia tensor.
+    pub unsafe fn from_onnx(
+        data: &mut Value<TensorValueType<T>>,
+        dst_device_name: &str,
+        allocator: A,
+     ) -> Result<Self, TensorError>
+    where
+        T: 'static +
+            IntoTensorElementType + 
+            PrimitiveTensorElementType + 
+            std::fmt::Debug + 
+            cudarc::driver::DeviceRepr + 
+            Clone,
+        // usize: FromIterator<T>,
+    {
+        let dst_dev_name: String;
+        let dst_dev_number: usize;
+        match check_device_name(dst_device_name) {
+            Ok((name, num)) => {
+                dst_dev_name = name;
+                match num {
+                    Some(n) => dst_dev_number = n,
+                    None => dst_dev_number = 0,
+                }
+            }
+            Err(e) => {
+                return Err(TensorError::UnsupportedOperation(format!(
+                    "Failed to check device name: {:?}, error: {:?}", 
+                    dst_device_name, e,
+                )))
+            }
+        }
+
+        if dst_dev_name == "cpu" {
+            let mem = data.memory_info();
+            match mem.allocation_device() {
+                AllocationDevice::CPU => {
+                    let (shape, data_vec) = data.extract_raw_tensor_mut();
+                    let vec_shape: Vec<usize> = shape.into_iter().map(|&x| x as usize).collect();
+                    println!("vec_shape: {:?}", vec_shape);
+                    let shape = unsqueeze_vec::<N>(&vec_shape).unwrap();
+                    println!("shape: {:?}", shape);
+                    let data_vec = data_vec.to_vec(); 
+
+                    let storage = TensorStorage::from_vec(data_vec, allocator);
+                    let strides = get_strides_from_shape(shape);
+                    return Ok(Self {
+                        storage,
+                        shape,
+                        strides,
+                    })       
+                },
+                AllocationDevice::CUDA => {
+                    return Err(TensorError::IncorrectDeviceName("Not implemented".to_string()))
+                },
+                _ => return Err(TensorError::UnsupportedOperation(format!(
+                    "Unsupported allocation device: {:?}",
+                    mem.allocation_device()
+                ))),
+            };
+        };
+            // let ort_tensor = ort::value::Tensor::from_array((self.shape, self.into_vec()))
+            //     .map_err(|err| TensorError::UnsupportedOperation(format!(
+            //     "Failed to create CPU Tensor, error: {:?}", 
+            //     err,
+            // ))).unwrap();
+            // return Ok(ort_tensor)
+        Err(TensorError::IncorrectDeviceName("Not implemented".to_string()))
+    }
+
+
+
 }
 
 impl<T, const N: usize, A> Clone for Tensor<T, N, A>
